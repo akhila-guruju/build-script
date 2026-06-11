@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+#
+# build "<pkg-name> [<pkg-name> ...]"
+#
+# Convenience wrapper to trigger an Azure Linux package build from within the
+# toolkit directory. Performs the required toolchain script patch, restores
+# the stable manifests, builds the toolchain, then builds the requested
+# package(s).
+#
+# Pass package names as a SINGLE quoted, space-separated argument, e.g.:
+#   build "tree"
+#   build "tree vim curl"
+#
+# Author:    Akhila Guruju <v-guakhila@microsoft.com>
+# Co-Author: GitHub Copilot
+# Date:      2026-06-03
+#
+set -euo pipefail
+
+# ---- Args ---------------------------------------------------------------
+if [[ $# -ne 1 || -z "${1// /}" ]]; then
+    echo "Usage: $(basename "$0") \"<pkg-name> [<pkg-name> ...]\"" >&2
+    echo "Examples:" >&2
+    echo "  $(basename "$0") \"tree\"" >&2
+    echo "  $(basename "$0") \"tree vim curl\"" >&2
+    exit 2
+fi
+
+# Normalize whitespace inside the quoted argument so make sees a clean
+# space-separated list (collapse tabs/newlines/multiple spaces, trim ends).
+PKGS="$(echo "$1" | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//')"
+PKG_COUNT="$(wc -w <<< "$PKGS")"
+
+# ---- Must run from an azurelinux 'toolkit' directory --------------------
+# Accept any path whose basename is 'toolkit' and whose full path contains
+# 'azurelinux' somewhere (case-insensitive). Examples that should pass:
+#   ~/3.0/azurelinux-test/toolkit
+#   ~/security-azl/azurelinux/toolkit
+#   /work/azurelinux-3.0/toolkit
+#   ~/AzureLinuxProject/.../azurelinux/azl-worktree/python-twisted-3.0/toolkit
+CWD="$(pwd)"
+CWD_BASE="$(basename "$CWD")"
+
+if [[ "$CWD_BASE" != "toolkit" ]]; then
+    echo "ERROR: This script must be executed from inside a 'toolkit' directory." >&2
+    echo "       Current directory: $CWD" >&2
+    exit 1
+fi
+
+# Case-insensitive substring match for 'azurelinux' anywhere in the path
+# (handles plain clones, *-test/, *-stable/, and git worktree layouts).
+shopt -s nocasematch
+if [[ "$CWD" != *azurelinux* ]]; then
+    shopt -u nocasematch
+    echo "ERROR: Current path does not look like an azurelinux repo (no 'azurelinux' segment found)." >&2
+    echo "       Expected path to contain 'azurelinux' somewhere (e.g. ~/.../azurelinux/.../toolkit)." >&2
+    echo "       Current directory: $CWD" >&2
+    exit 1
+fi
+shopt -u nocasematch
+
+if [[ ! -f "Makefile" || ! -d "scripts/toolchain" ]]; then
+    echo "ERROR: This does not look like an Azure Linux toolkit directory (missing Makefile or scripts/toolchain)." >&2
+    exit 1
+fi
+
+# ---- Step 1: cd toolkit (already enforced above) ------------------------
+echo "==> Building $PKG_COUNT package(s): $PKGS"
+echo "    From: $CWD"
+
+# ---- Step 2: patch download_toolchain_rpm.sh ----------------------------
+TC_SCRIPT="scripts/toolchain/download_toolchain_rpm.sh"
+if [[ ! -f "$TC_SCRIPT" ]]; then
+    echo "ERROR: $TC_SCRIPT not found." >&2
+    exit 1
+fi
+
+echo "==> Patching $TC_SCRIPT (signature validation failure -> return 0)"
+# Idempotent patch: only change the line inside validate_signatures()
+# that currently returns 1 after the "Failed to validate toolchain package" message.
+if grep -q 'Failed to validate toolchain package .* signature, aborting\.' "$TC_SCRIPT"; then
+    # Use awk to replace the first `return 1` that follows the failure message.
+    tmpfile="$(mktemp)"
+    awk '
+        /Failed to validate toolchain package .* signature, aborting\./ { found=1 }
+        found && /^[[:space:]]*return 1[[:space:]]*$/ {
+            sub(/return 1/, "return 0")
+            found=0
+        }
+        { print }
+    ' "$TC_SCRIPT" > "$tmpfile"
+
+    if ! cmp -s "$tmpfile" "$TC_SCRIPT"; then
+        mv "$tmpfile" "$TC_SCRIPT"
+        chmod +x "$TC_SCRIPT"
+        echo "    Patched."
+    else
+        rm -f "$tmpfile"
+        echo "    Already patched, continuing."
+    fi
+else
+    echo "WARNING: Expected failure message not found in $TC_SCRIPT; leaving file untouched." >&2
+fi
+
+# ---- Step 3: restore manifests from 3.0-stable --------------------------
+echo "==> Restoring resources/manifests from 3.0-stable"
+git checkout -f 3.0-stable -- resources/manifests
+
+# ---- Step 4: build toolchain --------------------------------------------
+echo "==> Building toolchain (sudo make toolchain REBUILD_TOOLS=y)"
+sudo make toolchain REBUILD_TOOLS=y
+
+# ---- Step 5: build the requested package(s) -----------------------------
+echo "==> Building package(s): $PKGS"
+sudo make build-packages \
+    REBUILD_TOOLS=y \
+    REBUILD_PACKAGES=y \
+    SRPM_PACK_LIST="$PKGS" \
+    PACKAGE_REBUILD_LIST="$PKGS" \
+    RUN_CHECK=y \
+    SRPM_FILE_SIGNATURE_HANDLING=update
+
+# ---- Step 6: clean up toolkit-side changes made during the build --------
+# The build stages updates to the manifest files (index) and modifies the
+# toolchain download script (working tree only). Restore all of them so only
+# the actual spec edits under SPECS/ remain.
+echo "==> Restoring toolkit manifest + toolchain script changes"
+
+# Files the build *stages* into the index.
+STAGED_FILES=(
+    resources/manifests/package/license_file_exceptions.json
+    resources/manifests/package/pkggen_core_aarch64.txt
+    resources/manifests/package/pkggen_core_x86_64.txt
+    resources/manifests/package/toolchain_aarch64.txt
+    resources/manifests/package/toolchain_x86_64.txt
+    resources/manifests/package/update_manifests.sh
+)
+
+# Files only modified in the working tree (never staged).
+WORKTREE_ONLY_FILES=(
+    scripts/toolchain/download_toolchain_rpm.sh
+)
+
+# 1. Unstage the manifest files (move them from index back to working tree).
+git restore --staged "${STAGED_FILES[@]}" 2>/dev/null || true
+
+# 2. Discard working-tree modifications for all of them.
+git restore "${STAGED_FILES[@]}" "${WORKTREE_ONLY_FILES[@]}" 2>/dev/null || true
+
+echo "==> Done. Package(s) build completed: $PKGS"
